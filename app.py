@@ -78,7 +78,14 @@ HEADERS = {
     "Sec-Fetch-User": "?1",
 }
 
-MAX_CONCURRENCY = 4  # simultaneous product-detail fetches
+MAX_CONCURRENCY = 1  # keep product-detail fetches gentle on Render/cloud hosts
+REQUEST_DELAY_RANGE = (2.0, 4.0)
+
+MYNTRA_ERROR_MARKERS = (
+    "Oops! Something went wrong",
+    "Please contact your administrator",
+    "Site Maintenance",
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -103,6 +110,22 @@ def _clean_url(raw: str) -> str:
     cleaned = cleaned.replace("\\u002f", "/")
     cleaned = re.sub(r'(?<!:)/{2,}', '/', cleaned)
     return cleaned
+
+
+def _style_id_to_url(style_id_or_url: str) -> str:
+    value = style_id_or_url.strip()
+    if value.startswith(("http://", "https://")):
+        return value
+    return f"https://www.myntra.com/{value}"
+
+
+def _is_myntra_error_page(html: str) -> bool:
+    return any(marker.lower() in html.lower() for marker in MYNTRA_ERROR_MARKERS)
+
+
+def _has_product_data(data: dict[str, Any]) -> bool:
+    required = (data.get("title"), data.get("brand"), data.get("current_price"))
+    return any(bool(value) for value in required) and data.get("title") != "Oops! Something went wrong"
 
 
 def _parse_product_page(html: str, url: str, style_id: str) -> dict[str, Any]:
@@ -510,6 +533,64 @@ async def _scrape_by_style_id(
         total = scraper_state["total_items"]
         label = data.get("title") or data.get("brand") or style_id
         _log(f"→ [{count}/{total}] {label}")
+        return data
+
+
+async def _fetch(client: httpx.AsyncClient, url: str) -> str | None:
+    """GET a URL with retries and reject Myntra error pages."""
+    for attempt in range(3):
+        try:
+            resp = await client.get(url, headers=HEADERS, follow_redirects=True, timeout=20)
+            if resp.status_code == 200:
+                if _is_myntra_error_page(resp.text):
+                    _log(f"Myntra returned an error page for {url}; retrying...")
+                    await asyncio.sleep(random.uniform(8.0, 14.0))
+                    continue
+                return resp.text
+            _log(f"HTTP {resp.status_code} for {url}")
+        except httpx.HTTPError as exc:
+            _log(f"Attempt {attempt + 1} error: {exc}")
+        await asyncio.sleep(random.uniform(4.0, 8.0))
+    return None
+
+
+def _mark_failed(style_id: str, reason: str) -> None:
+    scraper_state["failed_count"] += 1
+    scraper_state["scraped_count"] += 1
+    count = scraper_state["scraped_count"]
+    total = scraper_state["total_items"]
+    _log(f"FAILED {style_id}: {reason}")
+    _log(f"-> [{count}/{total}] FAILED - {style_id}")
+
+
+async def _scrape_by_style_id(
+    sem: asyncio.Semaphore,
+    client: httpx.AsyncClient,
+    style_id: str,
+) -> dict[str, Any] | None:
+    """Scrape a single product by style ID or full Myntra URL."""
+    async with sem:
+        if scraper_state["stop_event"].is_set():
+            return None
+        await asyncio.sleep(random.uniform(*REQUEST_DELAY_RANGE))
+
+        url = _style_id_to_url(style_id)
+        html = await _fetch(client, url)
+
+        if not html:
+            _mark_failed(style_id, "no usable product page returned")
+            return None
+
+        data = _parse_product_page(html, url, style_id)
+        if not _has_product_data(data):
+            _mark_failed(style_id, "Myntra returned non-product HTML")
+            return None
+
+        scraper_state["scraped_count"] += 1
+        count = scraper_state["scraped_count"]
+        total = scraper_state["total_items"]
+        label = data.get("title") or data.get("brand") or style_id
+        _log(f"-> [{count}/{total}] {label}")
         return data
 
 
