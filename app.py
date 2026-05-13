@@ -24,7 +24,7 @@ import httpx
 import pandas as pd
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, File, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -570,6 +570,11 @@ async def scrape_task(style_ids: list[str]) -> None:
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
     return templates.TemplateResponse("index.html", {"request": request})
+
+
+@app.head("/")
+async def index_head():
+    return Response(status_code=200)
 
 
 @app.post("/upload")
